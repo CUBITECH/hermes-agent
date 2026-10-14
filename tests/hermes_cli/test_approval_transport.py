@@ -293,6 +293,62 @@ def test_cli_selected_transport_replaces_builtin_prompt(monkeypatch):
     assert seen[0].allowed_choices == ("once", "session", "always", "deny")
 
 
+def test_once_only_plugin_approval_uses_selected_transport_and_pinned_timeout(
+    monkeypatch,
+):
+    from tools import approval
+
+    manager = PluginManager()
+    seen = []
+    _context(manager).register_approval_transport(
+        "phone", lambda request: seen.append(request) or request.respond("once")
+    )
+    _configure_manual_guard(monkeypatch, approval, manager)
+    monkeypatch.setattr(approval_context, "_get_approval_timeout", lambda: 86_400)
+
+    def builtin(*_args, **_kwargs):
+        raise AssertionError("builtin prompt must not materialize")
+
+    result = approval.request_tool_approval(
+        "hr_onboarding_attest_order",
+        "one exact HR decision",
+        rule_key="hr-request",
+        approval_callback=builtin,
+        one_time_only=True,
+        minimum_timeout_seconds=43_200,
+    )
+
+    assert result["approved"] is True
+    assert len(seen) == 1
+    assert seen[0].allowed_choices == ("once", "deny")
+    assert seen[0].timeout_seconds == 43_200
+
+
+def test_once_only_plugin_approval_rejects_short_host_timeout_before_transport(
+    monkeypatch,
+):
+    from tools import approval
+
+    manager = PluginManager()
+    seen = []
+    _context(manager).register_approval_transport(
+        "phone", lambda request: seen.append(request) or request.respond("once")
+    )
+    _configure_manual_guard(monkeypatch, approval, manager)
+    monkeypatch.setattr(approval_context, "_get_approval_timeout", lambda: 1)
+
+    result = approval.request_tool_approval(
+        "hr_onboarding_attest_order",
+        "one exact HR decision",
+        one_time_only=True,
+        minimum_timeout_seconds=43_200,
+    )
+
+    assert result["approved"] is False
+    assert result["outcome"] == "timeout_policy"
+    assert seen == []
+
+
 def test_gateway_selected_transport_does_not_require_gateway_notifier(monkeypatch):
     from tools import approval
     import tools.approval_context as tools_approval_context

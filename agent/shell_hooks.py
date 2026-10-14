@@ -478,6 +478,9 @@ def _parse_pre_tool_call(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             value = data.get(key)
             if isinstance(value, str) and value.strip():
                 directive[key] = value.strip()
+        for key in ("approval_scope", "minimum_timeout_seconds"):
+            if key in data:
+                directive[key] = data[key]
         return directive
     return None
 

@@ -1084,7 +1084,7 @@ class TestSendExecApprovalButtons:
         assert "Deny" in buttons[1]["reply"]["title"]
         approve_id = buttons[0]["reply"]["id"]
         deny_id = buttons[1]["reply"]["id"]
-        assert approve_id.startswith("appr:") and approve_id.endswith(":approve")
+        assert approve_id.startswith("appr:") and approve_id.endswith(":once")
         assert deny_id.startswith("appr:") and deny_id.endswith(":deny")
         approval_id = approve_id.split(":")[1]
         assert deny_id.split(":")[1] == approval_id
@@ -1209,13 +1209,13 @@ class TestDispatchInteractiveReplyApproval:
             "type": "interactive",
             "interactive": {
                 "type": "button_reply",
-                "button_reply": {"id": "appr:app1:approve", "title": "Approve"},
+                "button_reply": {"id": "appr:app1:once", "title": "Approve"},
             },
         }
         handled = await adapter._dispatch_interactive_reply(raw, {})
 
         assert handled is True
-        assert calls == [("sess-app-1", "approve")]
+        assert calls == [("sess-app-1", "once")]
         assert "app1" not in adapter._exec_approval_state
         confirm_payload = adapter._http_client.post.call_args.kwargs["json"]
         assert confirm_payload["type"] == "text"
@@ -1292,13 +1292,13 @@ class TestDispatchInteractiveReplyAuthorization:
             "type": "interactive",
             "interactive": {
                 "type": "button_reply",
-                "button_reply": {"id": "appr:app1:approve", "title": "Approve"},
+                "button_reply": {"id": "appr:app1:once", "title": "Approve"},
             },
         }
         handled = await adapter._dispatch_interactive_reply(raw, {})
 
         assert handled is True
-        assert calls == [("sess-app-1", "approve")]
+        assert calls == [("sess-app-1", "once")]
 
 
 @pytest.mark.usefixtures("authorized_interactive_env")

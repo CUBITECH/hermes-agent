@@ -501,7 +501,7 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         approval_id = uuid.uuid4().hex[:12]
         interactive = self._button_interactive(
             self._truncate_body(prompt.text),
-            (f"appr:{approval_id}:approve", self._truncate_button_label(t("platform.whatsapp.approve_button"))),
+            (f"appr:{approval_id}:once", self._truncate_button_label(t("platform.whatsapp.approve_button"))),
             (f"appr:{approval_id}:deny", self._truncate_button_label(t("platform.whatsapp.deny_button"))))
         return await self._send_interactive(
             prompt.chat_id, interactive, prompt.metadata, self._exec_approval_state, approval_id, prompt.session_key)
@@ -913,7 +913,7 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         session_key = self._pop_tap_state(
             self._exec_approval_state, approval_id,
             "[whatsapp_cloud] approval tap with no matching state (approval_id=%s) — likely stale; falling back to text",
-            choice, ("approve", "deny"),
+            choice, ("once", "deny"),
         )
         if not session_key:
             return False
@@ -924,7 +924,7 @@ class WhatsAppCloudAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         # A tap after the wait timed out (count == 0) must not claim approval:
         # the command was already denied fail-closed.
         if count:
-            confirm_text = t("platform.whatsapp.approved" if choice == "approve" else "platform.whatsapp.denied")
+            confirm_text = t("platform.whatsapp.approved" if choice == "once" else "platform.whatsapp.denied")
         else:
             logger.info("[whatsapp_cloud] approval resolver reported no waiter (session_key=%s) — likely already resolved", session_key)
             confirm_text = t("platform.whatsapp.approval_expired")

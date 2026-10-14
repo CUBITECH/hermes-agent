@@ -28,6 +28,7 @@ def _invoke_callback(
     allow_session=True,
     smart_denied=False,
     timeout=60.0,
+    request_timeout=None,
     use_prompt_path=False,
 ):
     loop = MagicMock(spec=asyncio.AbstractEventLoop)
@@ -51,6 +52,7 @@ def _invoke_callback(
                 allow_permanent=allow_permanent,
                 allow_session=allow_session,
                 smart_denied=smart_denied,
+                timeout_seconds=request_timeout,
                 approval_callback=cb,
             )
         else:
@@ -114,6 +116,16 @@ class TestApprovalBridge:
         )
 
         assert [option.option_id for option in kwargs["options"]] == ["allow_once", "deny"]
+
+    def test_prompt_timeout_overrides_callback_default(self):
+        _, _, _, future, _ = _invoke_callback(
+            AllowedOutcome(option_id="allow_once", outcome="selected"),
+            timeout=86_400,
+            request_timeout=43_200,
+            use_prompt_path=True,
+        )
+
+        future.result.assert_called_once_with(timeout=43_200.0)
 
     def test_tool_call_ids_are_unique(self):
         _, first_kwargs, _, _, _ = _invoke_callback(

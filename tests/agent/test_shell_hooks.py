@@ -48,6 +48,8 @@ class TestParseResponse:
     @pytest.mark.parametrize("stdout, expected", [
         ('{"action": "approve", "message": "  needs a human ", "rule_key": " terminal:rm "}',
          {"action": "approve", "message": "needs a human", "rule_key": "terminal:rm"}),
+        ('{"action": "approve", "approval_scope": "once", "minimum_timeout_seconds": 43200}',
+         {"action": "approve", "approval_scope": "once", "minimum_timeout_seconds": 43200}),
         ('{"action": "approve", "message": "", "rule_key": 7}', {"action": "approve"}),
         # Claude-Code's ``decision: approve`` means auto-ALLOW, not "ask a human": never mapped.
         ('{"decision": "approve", "reason": "ok"}', None),
@@ -159,7 +161,8 @@ class TestCallbackSubprocess:
         script = _write_script(
             tmp_path, "approve.sh",
             "#!/usr/bin/env bash\n"
-            'printf \'{"action": "approve", "message": "risky", "rule_key": "terminal:rm"}\\n\'\n',
+            'printf \'{"action": "approve", "message": "risky", "rule_key": "terminal:rm", '
+            '"approval_scope": "once", "minimum_timeout_seconds": 43200}\\n\'\n',
         )
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
         monkeypatch.setenv("HERMES_ACCEPT_HOOKS", "1")
@@ -170,12 +173,36 @@ class TestCallbackSubprocess:
         seen = []
 
         def _gate(tool_name, reason, **kwargs):
-            seen.append((tool_name, reason, kwargs.get("rule_key")))
+            seen.append((tool_name, reason, kwargs))
             return {"approved": False, "message": "denied by human"}
 
         monkeypatch.setattr("tools.approval.request_tool_approval", _gate)
         assert plugins.resolve_pre_tool_block("terminal", {"command": "rm"}) == "denied by human"
-        assert seen == [("terminal", "risky", "terminal:rm")]
+        assert seen == [("terminal", "risky", {
+            "rule_key": "terminal:rm",
+            "one_time_only": True,
+            "minimum_timeout_seconds": 43_200,
+        })]
+
+    def test_invalid_shell_hook_approval_timeout_fails_closed(self, tmp_path, monkeypatch):
+        from hermes_cli import plugins
+
+        script = _write_script(
+            tmp_path, "invalid-approve.sh",
+            "#!/usr/bin/env bash\n"
+            'printf \'{"action": "approve", "approval_scope": "once", '
+            '"minimum_timeout_seconds": "43200"}\\n\'\n',
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+        monkeypatch.setenv("HERMES_ACCEPT_HOOKS", "1")
+        plugins._plugin_manager = plugins.PluginManager()
+        cfg = {"hooks": {"pre_tool_call": [{"matcher": "terminal", "command": str(script)}]}}
+        assert len(shell_hooks.register_from_config(cfg, accept_hooks=True)) == 1
+
+        message = plugins.resolve_pre_tool_block("terminal", {"command": "rm"})
+
+        assert message is not None
+        assert "invalid minimum_timeout_seconds" in message
 
     def test_matcher_regex_filters_callback(self, tmp_path, monkeypatch):
         """A matcher set to 'terminal' must not fire for 'web_search'."""

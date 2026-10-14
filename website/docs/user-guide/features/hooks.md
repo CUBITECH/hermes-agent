@@ -567,9 +567,11 @@ def my_callback(tool_name: str, args: dict, task_id: str, **kwargs):
 return {"action": "block", "message": "Reason the tool call was blocked"}
 # or
 return {"action": "approve", "message": "Why approval is required", "rule_key": "optional:scope"}
+# or, for an exact non-persistable human decision
+return {"action": "approve", "approval_scope": "once", "minimum_timeout_seconds": 43200, "message": "Why approval is required", "rule_key": "request-specific"}
 ```
 
-Precedence is `block` > `approve` > no directive, regardless of registration order: any plugin's valid `block` wins over an earlier plugin's `approve`, and among `approve` directives the first valid one wins (Python plugins are registered first, then shell hooks). `block` requires a non-empty `message` and short-circuits the tool with that text as the error returned to the model. `approve` escalates the call to the existing human-approval gate; `message` and `rule_key` are optional, and denial, timeout, or gate error fails closed. Other return values are ignored, so existing observer-only callbacks keep working unchanged.
+Precedence is `block` > `approve` > no directive, regardless of registration order: any plugin's valid `block` wins over an earlier plugin's `approve`, and among `approve` directives the first valid one wins (Python plugins are registered first, then shell hooks). `block` requires a non-empty `message` and short-circuits the tool with that text as the error returned to the model. `approve` escalates the call to the existing human-approval gate; `message` and `rule_key` are optional, and denial, timeout, or gate error fails closed. `approval_scope: "once"` exposes only once/deny on local built-in callbacks and selected plugin transports; built-in gateway cards fail closed unless a request-bound transport is selected. It rejects broader choices returned by stale clients, ignores prior session/permanent grants, and cannot be bypassed by YOLO, approval-off, cron, single-query, or unattended auto-approval. With that scope, an optional non-negative integer `minimum_timeout_seconds` atomically rejects a shorter live host timeout and pins the requested value through transport, gateway, or CLI waiting. Once-only or explicitly timed requests are never coalesced with another gateway prompt; legacy coalescing requires the same scope policy. Unknown scopes or invalid timeout values fail closed. Other return values are ignored, so existing observer-only callbacks keep working unchanged.
 
 **Return value — rewrite the tool's arguments:**
 
@@ -1841,8 +1843,8 @@ profile's `HERMES_HOME`. `tool_name` and `tool_input` are `null` for non-tool ev
 {"action": "modify", "args": {"new_string": "fixed content"}}         // Hermes-canonical
 {"decision": "modify", "tool_input": {"new_string": "fixed content"}} // Claude-Code style
 
-// Escalate a pre_tool_call to the human-approval gate (Hermes-only; `message` and `rule_key`
-// are optional). Claude-Code's `{"decision": "approve"}` means auto-allow and is NOT mapped here:
+// Escalate a pre_tool_call to the human-approval gate (Hermes-only; `message`, `rule_key`, and
+// `approval_scope: "once"` / `minimum_timeout_seconds` are optional). Claude-Code's `{"decision": "approve"}` means auto-allow and is NOT mapped here:
 {"action": "approve", "message": "Why approval is required", "rule_key": "optional:scope"}
 
 // Inject context for pre_llm_call:

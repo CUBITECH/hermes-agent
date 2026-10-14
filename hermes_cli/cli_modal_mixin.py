@@ -1063,7 +1063,8 @@ class CLIModalMixin:
     def _approval_callback(self, command: str, description: str,
                            *, allow_permanent: bool = True,
                            allow_session: bool = True,
-                           smart_denied: bool = False) -> str:
+                           smart_denied: bool = False,
+                           timeout_seconds: int | None = None) -> str:
         """Dangerous-command approval through the prompt_toolkit UI (agent thread).
 
         Choices: once / session / always / deny (see ``_approval_choices``), plus 'view' for long
@@ -1073,7 +1074,10 @@ class CLIModalMixin:
         from cli import CLI_CONFIG, _DIM, _RST, _cprint
 
         with self._approval_lock:
-            timeout = int(CLI_CONFIG.get("approvals", {}).get("timeout", 300))
+            timeout = (
+                timeout_seconds if timeout_seconds is not None
+                else int(CLI_CONFIG.get("approvals", {}).get("timeout", 300))
+            )
             response_queue = queue.Queue()
             self._approval_state = {
                 "command": command,

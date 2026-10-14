@@ -166,7 +166,14 @@ def resolve_gateway_approval(session_key: str, choice: str,
         # ``_drop_entry`` reads ``entry.result`` under this same lock after its deadline check, so a
         # choice acked to the client here can never be popped-and-lost as a timeout (#112548).
         for entry in targets:
-            entry.result = choice
+            allowed = {"once", "deny"}
+            if entry.data.get("allow_session", True):
+                allowed.add("session")
+                if entry.data.get("allow_permanent", True):
+                    allowed.add("always")
+            entry.result = (
+                choice if isinstance(choice, str) and choice in allowed else "deny"
+            )
             if reason:
                 entry.reason = reason
             entry.event.set()
@@ -794,7 +801,8 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
                     pattern_key: str, pattern_keys: list[str], warnings: list[tuple],
                     session_key: str, approval_callback, is_cli: bool, is_gateway: bool,
                     is_ask: bool, smart: bool = False,
-                    permanent_capable: bool = True, pending_body=None) -> dict:
+                    permanent_capable: bool = True, one_time_only: bool = False,
+                    timeout_seconds: int | None = None, pending_body=None) -> dict:
     """Ask a human (after the optional guardian-LLM step) and turn the answer into the gate result.
 
     ``warnings`` are the ``(key, _, is_tirith)`` tuples :func:`_persist_choice` stores on
@@ -812,7 +820,8 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
         if result is not None:
             return result
     pending_body = pending_body() if pending_body else None
-    allow_permanent = permanent_capable and not smart_denied
+    allow_session = not smart_denied and not one_time_only
+    allow_permanent = permanent_capable and allow_session
 
     def deny(template: str, outcome: str, **fmt) -> dict:
         breaker = ""
@@ -825,18 +834,28 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
                        outcome=outcome, noun=spec.noun, **extra)
 
     def grant(choice: str) -> dict:
+        if one_time_only and choice != "once":
+            return _denied(
+                "BLOCKED: This action requires an exact one-time approval; "
+                "broader approval scopes are not accepted.",
+                pattern_key=pattern_key, description=description,
+                outcome="invalid_scope", noun=spec.noun,
+            )
         # A smart-DENY owner override is always one operation, even if an older client returns "session" or "always".
         if not smart_denied:
             _persist_choice(session_key, choice, warnings)
-        if spec.user_approved:
-            return _user_approved(session_key, description)
-        return _approved()
+        return (
+            _user_approved(session_key, description)
+            if spec.user_approved else _approved()
+        )
 
-    if spec.transport:
+    if spec.transport or one_time_only:
         attempt = _present_with_selected_transport(
             command=command, description=description, pattern_key=pattern_key, pattern_keys=pattern_keys,
             session_key=session_key, surface="gateway" if (is_gateway or is_ask) else "cli",
-            allow_session=not smart_denied, allow_permanent=allow_permanent,
+            allow_session=allow_session, allow_permanent=allow_permanent,
+            timeout_seconds=timeout_seconds,
+            require_selected=one_time_only and (is_gateway or is_ask),
         )
         choice, denied = _transport_choice(attempt, pattern_key=pattern_key, description=description)
         if denied is not None:
@@ -846,6 +865,7 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
                 _record_denial(session_key)
                 return deny(spec.transport_denied, "denied")
             return grant(choice)
+
 
     # Gateway/async approval: block the agent thread until /approve or /deny, mirroring the CLI's synchronous input()
     # flow. The agent never sees "approval_required" here — it gets output or a definitive BLOCKED.
@@ -862,12 +882,18 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
             data = {
                 "command": display_command, "pattern_key": pattern_key,
                 "pattern_keys": pattern_keys, "description": display_description,
-                "allow_permanent": permanent_capable and not smart_denied,
-                "allow_session": not smart_denied,
+                "allow_permanent": allow_permanent,
+                "allow_session": allow_session,
             }
             if smart_denied:
                 data["smart_denied"] = True
-            decision = _await_gateway_decision(session_key, notify_cb, data, surface="gateway")
+            decision = _await_gateway_decision(
+                session_key,
+                notify_cb,
+                data,
+                surface="gateway",
+                timeout_seconds=timeout_seconds,
+            )
             if decision.get("notify_failed"):
                 return _denied(spec.notify_failed, pattern_key=pattern_key,
                                description=description, outcome="notify_failed", noun=spec.noun)
@@ -912,8 +938,13 @@ def _human_decision(spec: _GateSpec, *, command: str, description: str,
     hook_kwargs = dict(command=prompt_command, description=prompt_description, pattern_key=pattern_key,
                        pattern_keys=list(pattern_keys), session_key=session_key, surface="cli")
     approval_context._fire_approval_hook("pre_approval_request", **hook_kwargs)
-    choice = prompt_dangerous_approval(prompt_command, prompt_description, allow_permanent=allow_permanent,
-                                       smart_denied=smart_denied, approval_callback=approval_callback)
+    choice = prompt_dangerous_approval(
+        prompt_command, prompt_description,
+        timeout_seconds=timeout_seconds,
+        allow_permanent=allow_permanent,
+        allow_session=allow_session, smart_denied=smart_denied,
+        approval_callback=approval_callback,
+    )
     approval_context._fire_approval_hook("post_approval_response", **hook_kwargs, choice=choice)
     if choice == "timeout":
         return deny(spec.cli_timeout, "timeout")
@@ -953,7 +984,9 @@ def _run_approval_gate(
     subject: str = "", noun: str = "flagged actions",
     advice: str = "Find an alternative approach that avoids this action.",
     cron_deny_message: str = "", single_query_deny_message: str = "", unattended_deny_message: str = "",
-    autoapprove_log_prefix: str, fail_closed_when_no_human: bool = False, no_human_block_message: str = "",
+    autoapprove_log_prefix: str, fail_closed_when_no_human: bool = False,
+    no_human_block_message: str = "", one_time_only: bool = False,
+    minimum_timeout_seconds: int | None = None,
 ) -> dict:
     """Shared human-approval gate for a flagged action (tool call or write): decision core for
     :func:`request_tool_approval` and the file-tool write gates.
@@ -970,13 +1003,57 @@ def _run_approval_gate(
     # ``approvals.mode: off`` is the third bypass source (the Desktop "Approvals: off" toggle writes it); the shell
     # guards honour it, so every action routed through this gate (computer_use, plugin rules, SSH-config writes,
     # dangerous-pattern prompts) must too, or "off" still prompts on those surfaces.
-    if _yolo_active() or approval_context._get_approval_mode() == "off":
+    timeout_seconds = None
+    if minimum_timeout_seconds is not None:
+        if type(minimum_timeout_seconds) is not int or minimum_timeout_seconds < 0:
+            return {
+                **_blocked(
+                    "BLOCKED: plugin approval minimum timeout is invalid.",
+                    pattern_key=pattern_key,
+                    description=description,
+                ),
+                "outcome": "timeout_policy",
+            }
+        try:
+            configured_timeout_seconds = approval_context._get_approval_timeout()
+        except Exception:
+            logger.exception("Could not resolve plugin approval timeout")
+            configured_timeout_seconds = None
+        if (type(configured_timeout_seconds) is not int
+                or configured_timeout_seconds < minimum_timeout_seconds):
+            return {
+                **_blocked(
+                    "BLOCKED: the configured approval timeout is shorter than the "
+                    "plugin's required human-decision window.",
+                    pattern_key=pattern_key,
+                    description=description,
+                ),
+                "outcome": "timeout_policy",
+            }
+        timeout_seconds = minimum_timeout_seconds
+    if not one_time_only and (
+        _yolo_active() or approval_context._get_approval_mode() == "off"
+    ):
         return _approved()
     session_key = get_current_session_key()
-    if is_approved(session_key, pattern_key):
+    if not one_time_only and is_approved(session_key, pattern_key):
         return _approved()
 
     approval_callback, is_cli, is_gateway, is_ask = _presence(approval_callback)
+    if one_time_only and not (is_cli or is_gateway or is_ask):
+        logger.warning(
+            "%s (pattern: %s): %s — no interactive user/gateway present; "
+            "BLOCKED (one-time approval required).",
+            autoapprove_log_prefix, pattern_key, description,
+        )
+        return _blocked(
+            no_human_block_message or (
+                f"BLOCKED: approval required ({description}) but no "
+                "interactive user or gateway is present to approve it."
+            ),
+            pattern_key=pattern_key,
+            description=description,
+        )
     if not is_cli and not is_gateway and not is_ask:
         log_args = (autoapprove_log_prefix, pattern_key, description)
         # Every unattended context resolves instantly — never a pending approval nobody can answer.
@@ -1018,6 +1095,7 @@ def _run_approval_gate(
         _ACTION_GATE, command=display_target, description=description, pattern_key=pattern_key,
         pattern_keys=[pattern_key], warnings=[(pattern_key, None, False)], session_key=session_key,
         approval_callback=approval_callback, is_cli=is_cli, is_gateway=is_gateway, is_ask=is_ask,
+        one_time_only=one_time_only, timeout_seconds=timeout_seconds,
     )
 
 
@@ -1101,7 +1179,9 @@ def check_dangerous_command(command: str, env_type: str,
     )
 
 
-def request_tool_approval(tool_name: str, reason: str, *, rule_key: str = "", approval_callback=None) -> dict:
+def request_tool_approval(tool_name: str, reason: str, *, rule_key: str = "", approval_callback=None,
+                          one_time_only: bool = False,
+                          minimum_timeout_seconds: int | None = None) -> dict:
     """Escalate an arbitrary tool call to the human-approval gate.
 
     Entry point for a plugin ``pre_tool_call`` hook returning ``{"action": "approve", ...}``:
@@ -1110,7 +1190,10 @@ def request_tool_approval(tool_name: str, reason: str, *, rule_key: str = "", ap
     the LLM cannot skip it. Cron honors ``approvals.cron_mode``; any OTHER non-interactive
     context without an approval bridge fails CLOSED. ``rule_key`` controls the ``[a]lways``
     allowlist grain; when empty it is ``tool_name`` + a hash of ``reason`` so DISTINCT reasons
-    on the same tool persist independently. Returns the ``check_dangerous_command`` result shape.
+    on the same tool persist independently. ``one_time_only`` ignores existing approvals and
+    disables every bypass/persistent scope, including YOLO and ``approvals.mode: off``.
+    ``minimum_timeout_seconds`` requires and pins the host timeout used by the actual prompt.
+    Returns the ``check_dangerous_command`` result shape.
     """
     description = reason or f"Plugin requires approval for {tool_name}"
     if not rule_key:
@@ -1124,6 +1207,8 @@ def request_tool_approval(tool_name: str, reason: str, *, rule_key: str = "", ap
         subject=subject, advice="Find an alternative approach.",
         autoapprove_log_prefix=f"plugin-escalated tool call '{tool_name}' in non-interactive non-gateway context",
         fail_closed_when_no_human=True,
+        one_time_only=one_time_only,
+        minimum_timeout_seconds=minimum_timeout_seconds,
         no_human_block_message=(f"BLOCKED: {subject} but no interactive user or gateway is present "
                                 "to approve it. A plugin flagged this action for human confirmation."),
     )

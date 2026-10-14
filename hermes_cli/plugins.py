@@ -1948,12 +1948,10 @@ def fire_pre_command_hook(
 _thread_tool_whitelist = threading.local()
 
 
-@dataclass(frozen=True)
-class _PreToolCallDirective:
-    action: Optional[str] = None
-    message: Optional[str] = None
-    rule_key: Optional[str] = None
-    modified_args: Optional[Dict[str, Any]] = None
+PLUGIN_RUNTIME_CAPABILITIES = frozenset({
+    "pre-tool-approval-once-v1",
+    "pre-tool-approval-min-timeout-v1",
+})
 
 
 def set_thread_tool_whitelist(
@@ -1972,55 +1970,23 @@ def _get_pre_tool_call_directive_details(
     tool_name: str, args: Optional[Dict[str, Any]], task_id: str = "", session_id: str = "",
     tool_call_id: str = "", turn_id: str = "", api_request_id: str = "",
     middleware_trace: Optional[List[Dict[str, Any]]] = None,
-) -> _PreToolCallDirective:
-    """Check ``pre_tool_call`` hooks for ``{"action": "block", "message"}`` (veto; message becomes
-    the tool result) or ``{"action": "approve", "message", "rule_key"?}`` (escalate ANY tool to the
-    human-approval gate; ``rule_key`` picks the ``[a]lways`` allowlist grain). Precedence is
-    ``block`` > ``approve`` > none, not registration order: any plugin's valid veto wins over an
-    earlier plugin's request for human confirmation (#87420); among approves the first valid one
-    wins. Irrelevant returns are ignored."""
-    allowed = getattr(_thread_tool_whitelist, "allowed", None)
-    if allowed is not None and tool_name not in allowed:
-        fmt = getattr(_thread_tool_whitelist, "fmt", "Tool '{tool_name}' denied")
-        return _PreToolCallDirective(action="block", message=fmt.format(tool_name=tool_name))
+):
+    """Aggregate hook results into one block, approval, or modify directive."""
     from hermes_cli.lifecycle import invoke_hook as invoke_lifecycle_hook
+    from hermes_cli.plugins_tool_directives import select_pre_tool_call_directive
+
     hook_results = invoke_lifecycle_hook(
         "pre_tool_call", tool_name=tool_name, args=args if isinstance(args, dict) else {},
         task_id=task_id, session_id=session_id, tool_call_id=tool_call_id, turn_id=turn_id,
         api_request_id=api_request_id, middleware_trace=list(middleware_trace or []),
     )
-    modified_args: Optional[Dict[str, Any]] = None
-    first_approve: Optional[Tuple[Optional[str], Optional[str]]] = None  # (message, rule_key)
-    for result in hook_results:
-        if not isinstance(result, dict):
-            continue
-        action = result.get("action")
-        # "modify" — transform tool_input before dispatch. Processed before the block/approve gate
-        # so modify directives are visible even when a later hook blocks. Each modify directive
-        # shallow-merges its keys into one accumulated dict built from the original args.
-        if action == "modify":
-            partial = result.get("args")
-            if isinstance(partial, dict) and partial:
-                modified_args = {**(modified_args if modified_args is not None else
-                                    (args if isinstance(args, dict) else {})), **partial}
-            continue
-        if action not in ("block", "approve"):
-            continue
-        message = result.get("message")
-        message = message if isinstance(message, str) and message else None
-        # A block directive requires a message (it becomes the tool result); approve's is optional.
-        if action == "block" and not message:
-            continue
-        if action == "block":
-            return _PreToolCallDirective(action="block", message=message, modified_args=modified_args)
-        # approve is held back until the whole list has been scanned for a veto.
-        if first_approve is None:
-            rule_key = result.get("rule_key")
-            first_approve = (message, (rule_key.strip() or None) if isinstance(rule_key, str) else None)
-    if first_approve is not None:
-        return _PreToolCallDirective(action="approve", message=first_approve[0], rule_key=first_approve[1],
-                                     modified_args=modified_args)
-    return _PreToolCallDirective(modified_args=modified_args)
+    return select_pre_tool_call_directive(
+        tool_name,
+        args,
+        hook_results,
+        getattr(_thread_tool_whitelist, "allowed", None),
+        getattr(_thread_tool_whitelist, "fmt", "Tool '{tool_name}' denied"),
+    )
 
 
 def get_pre_tool_call_directive(
@@ -2049,35 +2015,19 @@ def resolve_pre_tool_block(
 
 
 def _resolve_block_from_details(
-    details: "_PreToolCallDirective", tool_name: str, *, turn_id: str = "", tool_call_id: str = "",
+    details, tool_name: str, *, turn_id: str = "", tool_call_id: str = "",
     session_id: str = "",
 ) -> Optional[str]:
-    """The ONE place for the fail-closed approval logic: ``block`` blocks with its message; an
-    ``approve`` whose gate errors, denies, or times out is blocked; anything else proceeds."""
-    if details.action == "block":
-        return details.message
-    if details.action != "approve":
-        return None
-    try:
-        from tools.approval import request_tool_approval
-        from tools.approval_context import reset_current_observability_context, set_current_observability_context
-        approval_tokens = None
-        with suppress(Exception):
-            approval_tokens = set_current_observability_context(
-                turn_id=turn_id, tool_call_id=tool_call_id, session_id=session_id)
-        try:
-            result = request_tool_approval(tool_name, details.message or "", rule_key=details.rule_key or tool_name)
-        finally:
-            if approval_tokens is not None:
-                with suppress(Exception):
-                    reset_current_observability_context(approval_tokens)
-    except Exception:
-        # Fail-closed: if the gate itself errors, block rather than silently execute an action a
-        # plugin flagged for approval.
-        return f"BLOCKED: plugin approval gate failed for {tool_name}"
-    if not result.get("approved"):
-        return str(result.get("message") or f"BLOCKED: plugin approval required for {tool_name}")
-    return None
+    """Resolve a selected pre-tool directive through the host approval gate."""
+    from hermes_cli.plugins_tool_directives import resolve_pre_tool_block
+
+    return resolve_pre_tool_block(
+        details,
+        tool_name,
+        turn_id=turn_id,
+        tool_call_id=tool_call_id,
+        session_id=session_id,
+    )
 
 
 def _dispatch_pre_tool_call_hooks(

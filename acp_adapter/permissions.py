@@ -134,12 +134,17 @@ def make_approval_callback(request_permission_fn: Callable, loop: asyncio.Abstra
     (``None`` → ``approvals.timeout``, read per request)."""
 
     def _callback(command: str, description: str, *, allow_permanent: bool = True,
-                  allow_session: bool = True, smart_denied: bool = False, **_: object) -> str:
+                  allow_session: bool = True, smart_denied: bool = False,
+                  timeout_seconds: float | None = None, **_: object) -> str:
         options = _build_permission_options(allow_permanent=allow_permanent, allow_session=allow_session,
                                             smart_denied=smart_denied)
         response, timed_out = await_permission(
             request_permission_fn, loop, session_id, tool_call=_build_permission_tool_call(command, description),
-            options=options, timeout=resolve_permission_timeout(timeout), what="Permission request",
+            options=options,
+            timeout=resolve_permission_timeout(
+                timeout_seconds if timeout_seconds is not None else timeout
+            ),
+            what="Permission request",
             send_update=send_update,
         )
         if timed_out:

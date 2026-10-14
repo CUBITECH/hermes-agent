@@ -126,6 +126,33 @@ class TestCliApprovalUi:
         thread.join(timeout=2)
         assert result["value"] == "once"
 
+    def test_callback_uses_pinned_per_request_timeout(self):
+        cli = _make_cli_stub()
+        result = {}
+
+        def run_callback():
+            result["value"] = cli._approval_callback(
+                "<tool>",
+                "one exact decision",
+                allow_permanent=False,
+                allow_session=False,
+                timeout_seconds=43_200,
+            )
+
+        with patch("hermes_cli.cli_modal_mixin._time.monotonic", return_value=100.0):
+            thread = threading.Thread(target=run_callback, daemon=True)
+            thread.start()
+            deadline = time.time() + 2
+            while cli._approval_state is None and time.time() < deadline:
+                time.sleep(0.01)
+
+            assert cli._approval_state is not None
+            assert cli._approval_deadline == 43_300.0
+            cli._approval_state["response_queue"].put("deny")
+            thread.join(timeout=2)
+
+        assert result["value"] == "deny"
+
 
     def test_sudo_prompt_restores_existing_draft_after_response(self):
         cli = _make_cli_stub()

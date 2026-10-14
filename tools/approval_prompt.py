@@ -43,6 +43,7 @@ def prompt_dangerous_approval(command: str, description: str, timeout_seconds: i
 
     See #81887.
     """
+    timeout_is_explicit = timeout_seconds is not None
     if timeout_seconds is None:
         timeout_seconds = _ctx._get_approval_timeout()
     from tools.human_input_hooks import human_input_request
@@ -50,8 +51,11 @@ def prompt_dangerous_approval(command: str, description: str, timeout_seconds: i
     # record it as human-wait time so the concurrent batch deadline excludes it.
     # See #79719.
     with human_input_request("approval", prompt=command) as human, human_wait_window():
-        human.outcome = choice = _ask_human(command, description, timeout_seconds, allow_permanent,
-                                            approval_callback, allow_session, smart_denied, title=title)
+        human.outcome = choice = _ask_human(
+            command, description, timeout_seconds, allow_permanent,
+            approval_callback, allow_session, smart_denied,
+            forward_timeout=timeout_is_explicit, title=title,
+        )
         return choice
 
 
@@ -109,7 +113,8 @@ def callback_accepts(callback, keyword: str) -> bool:
 
 
 def _ask_human(command: str, description: str, timeout_seconds: int, allow_permanent: bool,
-               approval_callback, allow_session: bool, smart_denied: bool, title: str | None = None) -> str:
+               approval_callback, allow_session: bool, smart_denied: bool,
+               forward_timeout: bool = False, title: str | None = None) -> str:
     # Redact before any user-visible rendering; the original `command` still executes after approval. Same redactor as
     # memory/log sanitization so tokens mask consistently across surfaces.
     from agent.redact import redact_sensitive_text
@@ -124,8 +129,19 @@ def _ask_human(command: str, description: str, timeout_seconds: int, allow_perma
             callback_kwargs = {"allow_permanent": allow_permanent,
                                **({"allow_session": False} if not allow_session else {}),
                                **({"smart_denied": True} if smart_denied else {}),
+                               **({"timeout_seconds": timeout_seconds}
+                                  if forward_timeout and callback_accepts(
+                                      approval_callback, "timeout_seconds") else {}),
                                **({"title": title} if title and callback_accepts(approval_callback, "title") else {})}
-            return approval_callback(display_command, display_description, **callback_kwargs)
+            choice = approval_callback(
+                display_command, display_description, **callback_kwargs,
+            )
+            allowed_choices = {"once", "deny", "timeout", "cancelled"}
+            if allow_session and not smart_denied:
+                allowed_choices.add("session")
+                if allow_permanent:
+                    allowed_choices.add("always")
+            return choice if isinstance(choice, str) and choice in allowed_choices else "deny"
         except Exception as e:
             logger.error("Approval callback failed: %s", e, exc_info=True)
             return Unanswered(f"the approval callback failed: {type(e).__name__}")
@@ -199,15 +215,21 @@ def _attempt(name: str, choice, failure, fallback) -> dict:
 
 def _present_with_selected_transport(*, command: str, description: str, pattern_key: str,
                                      pattern_keys: list[str], session_key: str, surface: str,
-                                     allow_session: bool, allow_permanent: bool) -> dict:
+                                     allow_session: bool, allow_permanent: bool,
+                                     timeout_seconds: int | None = None,
+                                     require_selected: bool = False) -> dict:
     """Present through an explicitly selected plugin transport, if any. A selected
     transport replaces every built-in prompt surface; detection, allowed scopes,
     persistence, timeout, and final authorization stay host-owned. A failed
     transport reaches a built-in surface only under the explicit
-    ``transport_fallback: builtin`` opt-in."""
+    ``transport_fallback: builtin`` opt-in. Strict request-bound callers
+    suppress that fallback and fail closed on every selected-transport failure."""
     name, fallback = _ctx._get_approval_transport_config()
+    if require_selected:
+        fallback = None
     if name == "builtin":
-        return {"selected": False}
+        return (_attempt(name, "deny", "unsupported_surface", None)
+                if require_selected else {"selected": False})
 
     try:
         registered = get_plugin_manager().get_approval_transport(name)
@@ -223,7 +245,8 @@ def _present_with_selected_transport(*, command: str, description: str, pattern_
         from agent.redact import redact_sensitive_text
         from hermes_cli.approval_transport import ApprovalRequest, invoke_approval_transport
 
-        timeout_seconds = _ctx._get_approval_timeout()
+        if timeout_seconds is None:
+            timeout_seconds = _ctx._get_approval_timeout()
         request = ApprovalRequest.create(
             command=redact_sensitive_text(command, force=True),
             description=redact_sensitive_text(description, force=True), pattern_key=pattern_key,
@@ -320,7 +343,9 @@ def request_elicitation_consent(message: str, description: str, *,
             decision = _gw._await_gateway_decision(
                 session_key, notify_cb, {"command": message, "description": description,
                                          "pattern_key": "mcp_elicitation",
-                                         "pattern_keys": ["mcp_elicitation"]}, surface=surface)
+                                         "pattern_keys": ["mcp_elicitation"]},
+                surface=surface, timeout_seconds=timeout_seconds,
+            )
         except Exception as exc:
             logger.error("Elicitation gateway dispatch failed: %s", exc, exc_info=True)
             return "decline"

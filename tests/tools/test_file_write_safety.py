@@ -673,6 +673,18 @@ class TestProtectedInstructionFiles:
         assert target.read_text(encoding="utf-8") == "approved content"
         assert len(approvals["calls"]) == 1
 
+    @pytest.mark.parametrize("stale_choice", ["session", "always"])
+    def test_stale_broader_scope_cannot_approve_protected_write(
+        self, tmp_path, approvals, stale_choice,
+    ):
+        target = tmp_path / "AGENTS.md"
+        approvals["answer"] = stale_choice
+
+        res = self._write(target, "must not land")
+
+        assert res.get("error") and "BLOCKED" in res["error"]
+        assert not target.exists()
+
     def test_prompts_even_under_yolo(self, tmp_path, approvals, monkeypatch):
         """The whole point: auto-approve/yolo must NOT bypass this gate."""
         import tools.approval as A

@@ -336,8 +336,8 @@ def _request_protected_instruction_approval(reasons: list[str], task_id: str = "
             return blocked.format(why="approval prompt could not be delivered or was not answered "
                                       f"({getattr(choice, 'cause', 'no answer')}).")
         timed = choice == "timeout"
-    # Any tapped scope is a one-operation grant; nothing is persisted.
-    if not timed and choice in {"once", "session", "always"}:
+    # Protected instruction writes accept exactly one operation; nothing persists.
+    if not timed and choice == "once":
         return None
     return timed_out if timed else denied
 
